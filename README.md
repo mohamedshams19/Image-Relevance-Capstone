@@ -1,73 +1,121 @@
 # AI Image Understanding & Content Matching Engine
 
-A system that understands an image library using AI vision, matches the right image to the right blog post based on meaning (not filenames or keywords), and refuses to guess when no image is a confident match.
+Understands an image library using AI vision, matches the right image to the right blog post based on meaning (not filenames or keywords), and refuses to guess when no image is a confident match — a red-fox post gets the red-fox photo, never the wolf.
 
-## The problem
+## Architecture
 
-Given a library of images and a set of blog posts, automatically suggest the best-matching image for each post — while never suggesting a wrong match with false confidence. A post about red foxes should get a red fox photo; a similar-looking wolf photo must be rejected, with a clear reason why.
+```
+Images ──(batch job)──► Vision Model (Ollama/llava) ──► {subject, category, attributes, caption, confidence}
+                                                              │
+                                                              ├──► stored in images table
+                                                              └──► embed(caption) ──► image_embeddings
 
-## Design
+Posts ─────────────────────────────────────────────────────► embed(title + content) ──► post_embeddings
 
-### Image metadata schema
-
-Every image is processed by a vision model (Gemini Flash) and produces structured, schema-validated metadata:
-
-```json
-{
-  "subject": "red fox",
-  "category": "animal",
-  "attributes": ["orange fur", "wild", "forest"],
-  "caption": "A red fox standing in a forest",
-  "confidence": 0.94
-}
+GET /posts/:id/images
+   └──► rank all images by cosine similarity to the post's embedding
+   └──► for each candidate, top to bottom:
+          Mismatch Guard checks: confidence ≥ 0.6, similarity ≥ 0.4, subject relevance
+          ├──► first candidate to pass → suggested image (with reason)
+          └──► none pass → "no confident match" (with reason)
+   └──► every attempt logged to suggestions table
+   └──► Review API: GET /suggestions · POST /suggestions/:id/approve · POST /suggestions/:id/reject
 ```
 
-- `subject` — the specific thing in the image (string)
-- `category` — a coarse grouping from a small fixed set (string), used for fast guard checks
-- `attributes` — descriptive tags (array of strings)
-- `caption` — a natural-language description, used to generate the embedding for matching
-- `confidence` — the vision model's own 0–1 estimate; low-confidence results are flagged for review rather than trusted silently
+## How to run it
 
-Responses are validated against this schema with Zod. Invalid responses are never accepted — they are retried or flagged.
+1. Clone this repo:
+   ```
+   git clone https://github.com/mohamedshams19/Image-Relevance-Capstone.git
+   cd Image-Relevance-Capstone
+   ```
+2. Copy the environment template and fill in real values:
+   ```
+   copy .env.example .env
+   ```
+   You'll need a free Unsplash API key (for the image download script). No Gemini key is required for the current build — vision runs locally via Ollama.
+3. Install [Ollama](https://ollama.com/download), then pull the two local models used:
+   ```
+   ollama pull llava
+   ollama pull all-minilm
+   ```
+4. Start the database:
+   ```
+   docker compose up -d
+   ```
+5. Seed the data (downloads ~50 images, tags them, generates embeddings, creates test posts):
+   ```
+   node scripts/download-images.js
+   node src/vision/batchClassify.js
+   node src/matching/embedImages.js
+   node scripts/seed-posts.js
+   node src/matching/embedPosts.js
+   ```
+6. Start the API:
+   ```
+   node src/server.js
+   ```
+   Now running at `http://localhost:3001`.
+7. Run the tests:
+   ```
+   npm test
+   ```
+8. Run the evaluation:
+   ```
+   node scripts/eval.js
+   ```
 
-### Database design
+## Try it
 
-- **images** — id, filename, url, subject, category, attributes (array), caption, confidence, created_at
-- **posts** — id, title, content, created_at
-- **image_embeddings** — image_id, embedding (vector)
-- **post_embeddings** — post_id, embedding (vector)
-- **suggestions** — id, post_id, image_id, similarity_score, guard_passed (bool), guard_reason, status (pending / approved / rejected)
+```
+curl http://localhost:3001/posts/1/images
+```
+Returns a suggested image with the guard's reasoning for the fox post.
 
-### Matching strategy
+```
+curl http://localhost:3001/posts/3/images
+```
+Returns `"suggested_image": null` for the gardening post — no relevant image exists, and the system says so rather than guessing.
 
-1. Generate an embedding for each image's `caption` and each post's text/title, using Gemini's embedding model.
-2. For a given post, compute cosine similarity between the post's embedding and every image's embedding, and rank candidates descending by similarity.
+## Evaluation
 
-### The mismatch guard
+Top-1 precision on the labeled evaluation set: **100% (3/3)**. See `scripts/eval.js` and `EVIDENCE.md` for the full run output.
 
-Before any suggestion reaches a human, the top candidate must pass three checks:
+Honestly: this eval set has only 3 posts, which is small even by the brief's own "small labeled evaluation dataset" standard. The 100% figure demonstrates the system working correctly on its test cases, not a statistically strong accuracy claim — treat it as a proof of concept.
 
-1. **Category/subject relevance** — does the image's `category`/`subject` plausibly relate to the post's topic?
-2. **Similarity threshold** — is the cosine similarity score above a tuned cutoff? (Tuned using a labeled evaluation set, not guessed.)
-3. **Confidence** — was the image's own vision-tagging confidence high enough to trust in the first place?
+## The mismatch guard
 
-If any check fails, the suggestion is rejected with a specific, human-readable reason (e.g. `"Animal category mismatch: expected fox, detected wolf"`). If no image clears the bar at all, the system responds with "no confident match" and its reasons — rather than returning the best of a bad set.
+Every candidate image must pass three checks before being suggested:
 
-## Non-goal
+1. **Vision confidence** — was the model itself confident about this image's classification? (≥ 0.6)
+2. **Similarity threshold** — is the semantic similarity between the post and the image's caption high enough? (≥ 0.4)
+3. **Subject relevance** — does the post's own text actually reference this image's subject?
 
-This project does not build a general-purpose image search engine or a full frontend UI. The review interface is API endpoints plus a simple table, not a polished admin panel.
+A real example that shows why all three matter: forcing a wolf image onto the fox post scored 0.4523 similarity — *above* the numeric threshold, meaning similarity alone would have wrongly allowed it. The subject-relevance check caught what the similarity score missed and correctly rejected it:
 
-## Dataset
-
-~50 images across a few animal categories (fox, wolf, dog, bear, deer), sourced from Unsplash/Pexels under their free licenses, gathered via a small download script (`scripts/download-images.js`) so the corpus is reproducible without committing binary image files to the repo.
+```
+Guard result: REJECTED
+Reason: Subject mismatch: post does not mention "wolves" or related terms
+```
 
 ## Stack
 
 - Node.js + Express
-- PostgreSQL (via Docker)
-- Gemini Flash — vision understanding + embeddings (free tier)
-- Zod — schema validation
+- PostgreSQL, via Docker
+- Ollama (local): `llava` for vision, `all-minilm` for embeddings
+- Zod for schema validation
+- Vitest for automated tests
 
-## Status
+## Limitations
 
-Phase 1 (design) in progress.
+- **Vision accuracy**: running locally via Ollama's `llava` model trades accuracy for zero cost and no rate limits. It is noticeably less reliable than a cloud model — one dog photo, for example, was classified with category `"person"` instead of `"animal"`. This is a genuine limitation of the current build, not silently hidden: it's exactly why confidence-flagging and the mismatch guard exist as a second line of defense against a single unreliable classification.
+- **Why Ollama instead of Gemini**: the original plan used Gemini Flash's free tier, but its daily quota (20 requests/day) made iterating on a 50-image dataset impractical during development. Ollama was the supported local alternative named in the capstone brief, not a deviation from it.
+- **Small eval set**: 3 labeled posts is minimal. A stronger precision claim would need a larger, more varied set (more posts, more edge cases, more categories tested against each other).
+- **No frontend**: as scoped by the brief, the review interface is API endpoints only (`GET /suggestions`, approve/reject), not a UI.
+
+## Required files
+
+- `capstone.yaml` — run/seed/test commands for evaluators
+- `EVIDENCE.md` — pasted proof for every Definition-of-Done checkbox
+- `BUILDLOG.md` — honest AI-usage log
+- `.env.example` — every environment variable, placeholder values only

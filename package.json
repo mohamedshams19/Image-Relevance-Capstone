@@ -4,8 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
+  "test": "vitest run"
+},
+
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mohamedshams19/Image-Relevance-Capstone.git"
@@ -24,5 +25,8 @@
     "express": "^5.2.1",
     "pg": "^8.23.0",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
   }
 }

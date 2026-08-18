@@ -1,0 +1,10 @@
+run: docker compose up -d && node src/server.js
+seed: node scripts/download-images.js && node src/vision/batchClassify.js && node src/matching/embedImages.js && node scripts/seed-posts.js && node src/matching/embedPosts.js
+test: npm test
+base_url: http://localhost:3001
+endpoints:
+  - GET /
+  - GET /posts/:id/images
+  - GET /suggestions
+  - POST /suggestions/:id/approve
+  - POST /suggestions/:id/reject
